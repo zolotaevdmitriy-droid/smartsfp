@@ -7,7 +7,9 @@ Cargo.lock.bak
 agent/bin/
 controller/bin/
 *.test
-vendor/
+# Go vendor dirs (NOT docs/vendor — that holds PDFs)
+/agent/vendor/
+/controller/vendor/
 
 # Node
 node_modules/
