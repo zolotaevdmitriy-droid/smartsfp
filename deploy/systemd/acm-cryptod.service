@@ -1,0 +1,76 @@
+# ACM-UZ crypto datapath.
+#
+# Runs on Smart SFP ISM4120I. Pinned to CPU core 1 (core 0 is left for the
+# agent and OS). DPDK + MUSDK SAM require IPC_LOCK + RAW capabilities to
+# attach UIO/VFIO devices and lock hugepages.
+#
+# Install: copy this file to /etc/systemd/system/acm-cryptod.service on
+# the module, then `systemctl daemon-reload && systemctl enable --now
+# acm-cryptod`.
+
+[Unit]
+Description=ACM-UZ crypto datapath (DPDK + MUSDK SAM)
+Documentation=https://github.com/zolotaevdmitriy-droid/smartsfp
+After=network-pre.target
+Wants=network-pre.target
+Before=acm-agent.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+WatchdogSec=30s
+
+# Preflight (verifies hugepages present, kernel modules loaded, etc.)
+ExecStartPre=/usr/local/bin/acm-cli preflight
+ExecStart=/usr/local/bin/acm-cryptod --config /etc/acm/cryptod.toml
+ExecStop=/bin/kill -SIGTERM $MAINPID
+
+Restart=on-failure
+RestartSec=3s
+StartLimitBurst=5
+StartLimitIntervalSec=60s
+
+# DPDK / MUSDK SAM need root-equivalent capabilities, but NOT full root.
+CapabilityBoundingSet=CAP_IPC_LOCK CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_NICE CAP_SYS_RAWIO CAP_SYS_RESOURCE
+AmbientCapabilities=CAP_IPC_LOCK CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_NICE CAP_SYS_RAWIO CAP_SYS_RESOURCE
+
+# Memory: cryptod must lock hugepages, so MEMLOCK is unlimited.
+LimitMEMLOCK=infinity
+MemoryHigh=550M
+MemoryMax=650M
+MemoryAccounting=yes
+TasksMax=200
+
+# Pin to CPU core 1 (Cortex-A53 #2). Core 0 belongs to acm-agent + OS.
+CPUAffinity=1
+CPUAccounting=yes
+CPUWeight=200
+
+# Filesystem isolation — what cryptod is allowed to touch.
+ProtectSystem=strict
+ReadWritePaths=/run/acm /var/lib/acm /dev/hugepages
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelLogs=true
+ProtectKernelModules=false
+ProtectKernelTunables=false
+ProtectControlGroups=true
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+RestrictRealtime=false
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
+
+# IO scheduling — make sure cryptod is not blocked by disk IO from other
+# services. We don't write much, but eMMC can stall.
+IOSchedulingClass=realtime
+IOSchedulingPriority=2
+
+# Logging via journald.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=acm-cryptod
+
+[Install]
+WantedBy=multi-user.target

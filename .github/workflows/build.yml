@@ -1,0 +1,134 @@
+# Build everything in the same Docker image used for local development.
+# No host toolchain installation, no duplicate config — CI runs the exact
+# steps a developer runs locally via ./dev.sh.
+
+name: build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Cross-compile cryptod + agent + controller
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Builder image is heavy (~2.5 GB after extraction). Cache it
+      # between runs to avoid rebuilding rust+go+node+protoc every push.
+      - name: Build / load cached builder image
+        uses: docker/build-push-action@v6
+        with:
+          context: docker
+          file: docker/builder.Dockerfile
+          tags: acm-uz/builder:latest
+          load: true
+          cache-from: type=gha,scope=builder
+          cache-to: type=gha,scope=builder,mode=max
+
+      - name: Cross-compile (cryptod, agent, controller)
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/work" \
+            -w /work \
+            acm-uz/builder:latest \
+            bash -lc "
+              set -e
+              echo '=== Build cryptod (aarch64) ==='
+              cd cryptod && cargo build --release --target aarch64-unknown-linux-gnu && cd ..
+
+              echo '=== Build agent (aarch64) ==='
+              cd agent
+              GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags='-s -w' -o ../dist/acm-agent ./cmd/acm-agent
+              GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags='-s -w' -o ../dist/acm-cli ./cmd/acm-cli
+              cd ..
+
+              echo '=== Build controller (amd64) ==='
+              cd controller
+              GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags='-s -w' -o ../dist/acm-controller ./cmd/acm-controller
+              cd ..
+
+              mkdir -p dist
+              cp cryptod/target/aarch64-unknown-linux-gnu/release/acm-cryptod dist/
+
+              ls -la dist/
+              file dist/*
+            "
+
+      - name: Run tests
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/work" \
+            -w /work \
+            acm-uz/builder:latest \
+            bash -lc "
+              set -e
+              cd cryptod && cargo test --workspace && cd ..
+              cd agent && go test ./... && cd ..
+              cd controller && go test ./... && cd ..
+            "
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: acm-uz-bin-${{ github.sha }}
+          path: dist/
+          retention-days: 14
+
+  lint:
+    name: Lint (rustfmt / clippy / gofmt / go vet)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Reuse cached builder image
+        uses: docker/build-push-action@v6
+        with:
+          context: docker
+          file: docker/builder.Dockerfile
+          tags: acm-uz/builder:latest
+          load: true
+          cache-from: type=gha,scope=builder
+
+      - name: Lint
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/work" \
+            -w /work \
+            acm-uz/builder:latest \
+            bash -lc "
+              set -e
+              echo '=== rustfmt --check ==='
+              cd cryptod && cargo fmt --all -- --check && cd ..
+
+              echo '=== clippy ==='
+              cd cryptod && cargo clippy --workspace --all-targets -- -D warnings && cd ..
+
+              echo '=== gofmt -l (agent) ==='
+              cd agent && test -z \"\$(gofmt -l .)\" && cd ..
+
+              echo '=== gofmt -l (controller) ==='
+              cd controller && test -z \"\$(gofmt -l .)\" && cd ..
+
+              echo '=== go vet (agent) ==='
+              cd agent && go vet ./... && cd ..
+
+              echo '=== go vet (controller) ==='
+              cd controller && go vet ./... && cd ..
+            "
