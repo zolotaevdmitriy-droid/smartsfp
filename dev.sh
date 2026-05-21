@@ -31,7 +31,7 @@ run_in_container() {
     -v "${GO_VOL}":/go/pkg/mod \
     -w /work \
     "${IMAGE_TAG}" \
-    bash -lc "$1"
+    bash -c "$1"
 }
 
 run_in_container_tty() {

@@ -43,7 +43,7 @@ jobs:
             -v "${{ github.workspace }}:/work" \
             -w /work \
             acm-uz/builder:latest \
-            bash -lc "
+            bash -c "
               set -e
               echo '=== Build cryptod (aarch64) ==='
               cd cryptod && cargo build --release --target aarch64-unknown-linux-gnu && cd ..
@@ -72,7 +72,7 @@ jobs:
             -v "${{ github.workspace }}:/work" \
             -w /work \
             acm-uz/builder:latest \
-            bash -lc "
+            bash -c "
               set -e
               cd cryptod && cargo test --workspace && cd ..
               cd agent && go test ./... && cd ..
@@ -112,7 +112,7 @@ jobs:
             -v "${{ github.workspace }}:/work" \
             -w /work \
             acm-uz/builder:latest \
-            bash -lc "
+            bash -c "
               set -e
               echo '=== rustfmt --check ==='
               cd cryptod && cargo fmt --all -- --check && cd ..

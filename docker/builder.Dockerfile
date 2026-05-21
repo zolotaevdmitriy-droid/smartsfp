@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl wget gnupg lsb-release \
         git make cmake ninja-build pkg-config build-essential \
         gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+        libc6-dev-arm64-cross linux-libc-dev-arm64-cross \
         libssl-dev libclang-dev \
         unzip xz-utils file vim less \
     && rm -rf /var/lib/apt/lists/*
@@ -79,4 +80,4 @@ RUN GOBIN=/usr/local/bin go install google.golang.org/protobuf/cmd/protoc-gen-go
 WORKDIR /work
 
 # Sanity print on container start.
-CMD ["bash", "-lc", "echo 'ACM-UZ builder ready.'; echo '  rust    : ' $(rustc --version); echo '  cargo   : ' $(cargo --version); echo '  go      : ' $(go version); echo '  node    : ' $(node --version); echo '  protoc  : ' $(protoc --version); exec bash"]
+CMD ["bash", "-c", "echo 'ACM-UZ builder ready.'; echo '  rust    : ' $(rustc --version); echo '  cargo   : ' $(cargo --version); echo '  go      : ' $(go version); echo '  node    : ' $(node --version); echo '  protoc  : ' $(protoc --version); exec bash"]
