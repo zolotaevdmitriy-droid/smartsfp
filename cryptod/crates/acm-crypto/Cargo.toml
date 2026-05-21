@@ -1,0 +1,11 @@
+[package]
+name = "acm-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Crypto provider abstraction for ACM-UZ datapath. Pluggable AES / O'z DSt 1105 implementations."
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true

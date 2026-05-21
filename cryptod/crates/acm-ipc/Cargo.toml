@@ -1,0 +1,14 @@
+[package]
+name = "acm-ipc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "IPC between acm-cryptod (Rust) and acm-agent (Go) via Unix Domain Socket."
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+thiserror.workspace = true

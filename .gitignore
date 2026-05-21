@@ -1,0 +1,50 @@
+# Rust
+target/
+Cargo.lock.bak
+*.rs.bk
+
+# Go
+agent/bin/
+controller/bin/
+*.test
+vendor/
+
+# Node
+node_modules/
+dist-web/
+.svelte-kit/
+
+# Build artifacts
+dist/
+build/
+*.o
+*.so
+*.dll
+*.exe.local
+
+# OTA packages
+*.tar.gz.sig
+acm-update-*.tar.gz
+
+# IDE / editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+*.local
+
+# Temporary recon output
+recon_output.txt
+scripts/output/
+
+# Docker volume cache (if mounted to .docker-cache)
+.docker-cache/

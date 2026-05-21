@@ -1,0 +1,15 @@
+[package]
+name = "acm-dpdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Thin FFI bindings to DPDK 25.0 and MUSDK on Marvell Armada 3720."
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+
+# TODO Phase 1: pull bindgen as a build-dependency once we add real bindings.
+# [build-dependencies]
+# bindgen = "0.69"

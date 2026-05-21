@@ -1,0 +1,11 @@
+# Per-target linker configuration for cross-compilation.
+# The Docker builder ships aarch64-linux-gnu-gcc; we point cargo at it.
+
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+
+# Useful aliases. Run e.g. `cargo arm-build` inside the container.
+[alias]
+arm-build = "build --release --target aarch64-unknown-linux-gnu"
+arm-check = "check --target aarch64-unknown-linux-gnu"
+arm-clippy = "clippy --target aarch64-unknown-linux-gnu --all-targets -- -D warnings"

@@ -1,0 +1,141 @@
+// ACM-UZ shared protobuf definitions.
+//
+// Two services are defined here:
+//
+//   CryptoControl   acm-agent (Go) <-> acm-cryptod (Rust), Unix domain
+//                   socket on /run/acm/cryptod.sock. Low-rate control
+//                   plane only; high-rate stats use a separate shared
+//                   memory ring (not in this schema).
+//
+//   AgentControl    controller (Go) <-> acm-agent (Go), gRPC over mTLS.
+//                   Reverse channel: the agent dials the controller and
+//                   the controller pushes commands.
+//
+// Wire stability: once tagged 1.0, field numbers and types are frozen.
+// Add new fields, never reuse numbers.
+
+syntax = "proto3";
+
+package acm.v1;
+
+option go_package = "github.com/zolotaevdmitriy-droid/smartsfp/proto/gen/go;acmv1";
+
+// ============================================================
+// CryptoControl: agent <-> cryptod, local UDS
+// ============================================================
+
+service CryptoControl {
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+  rpc SetPolicy(SetPolicyRequest) returns (SetPolicyResponse);
+  rpc RotateKey(RotateKeyRequest) returns (RotateKeyResponse);
+  rpc StreamEvents(StreamEventsRequest) returns (stream Event);
+}
+
+message GetStatusRequest {}
+message GetStatusResponse {
+  string version       = 1;
+  bool   running       = 2;
+  uint64 packets_in    = 3;
+  uint64 packets_out   = 4;
+  uint64 bytes_in      = 5;
+  uint64 bytes_out     = 6;
+  uint64 crypto_errors = 7;
+  uint64 uptime_s      = 8;
+  repeated KeyInfo keys = 9;
+}
+
+message KeyInfo {
+  uint32 id       = 1;
+  uint32 algo     = 2; // matches AlgoId (0x01=AES-128-GCM, 0x02=AES-256-GCM, 0x10=O'z DSt 1105)
+  int64  rotated_at_unix_s = 3;
+  uint64 packets_sealed    = 4;
+}
+
+message SetPolicyRequest  { bytes policy_blob = 1; }
+message SetPolicyResponse { bool ok = 1; string error = 2; }
+
+message RotateKeyRequest {
+  uint32 key_id    = 1;
+  uint32 algo      = 2;
+  bytes  material  = 3;
+}
+message RotateKeyResponse { bool ok = 1; string error = 2; }
+
+message StreamEventsRequest {}
+message Event {
+  enum Severity {
+    SEVERITY_UNKNOWN  = 0;
+    SEVERITY_INFO     = 1;
+    SEVERITY_WARNING  = 2;
+    SEVERITY_ERROR    = 3;
+    SEVERITY_CRITICAL = 4;
+  }
+  Severity severity   = 1;
+  string   category   = 2; // "crypto.auth_fail", "policy.applied", etc.
+  string   message    = 3;
+  int64    ts_unix_ns = 4;
+  map<string, string> attributes = 5;
+}
+
+// ============================================================
+// AgentControl: controller <-> agent, gRPC + mTLS
+// ============================================================
+
+service AgentControl {
+  // Initial bootstrap. The agent dials in with its device certificate
+  // (CN = serial) and receives its configuration.
+  rpc Provision(ProvisionRequest) returns (ProvisionResponse);
+
+  // Periodic heartbeat from agent to controller.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // Push a policy from controller to agent. Agent applies it and may
+  // forward to cryptod via CryptoControl.SetPolicy.
+  rpc PushPolicy(PushPolicyRequest) returns (PushPolicyResponse);
+
+  // Telemetry stream agent -> controller. Bidirectional so the
+  // controller can acknowledge / request specific metrics.
+  rpc StreamTelemetry(stream TelemetryBatch) returns (stream TelemetryAck);
+}
+
+message ProvisionRequest {
+  string serial         = 1;
+  string hardware_model = 2; // "ISM4120I"
+  string software_version = 3;
+}
+message ProvisionResponse {
+  bytes  config_blob    = 1;
+  string assigned_hostname = 2;
+  string assigned_ip    = 3;
+  string controller_ca_cert = 4;
+}
+
+message HeartbeatRequest {
+  string serial     = 1;
+  uint64 uptime_s   = 2;
+  string fw_version = 3;
+}
+message HeartbeatResponse {
+  int64  server_time_unix_s = 1;
+  bool   policy_update_available = 2;
+}
+
+message PushPolicyRequest  { bytes policy_blob = 1; uint64 policy_version = 2; }
+message PushPolicyResponse { bool ok = 1; string error = 2; }
+
+message TelemetryBatch {
+  string serial = 1;
+  repeated Metric metrics = 2;
+  int64 batch_ts_unix_ns = 3;
+}
+
+message Metric {
+  string name = 1;
+  map<string, string> labels = 2;
+  double value = 3;
+  int64  ts_unix_ns = 4;
+}
+
+message TelemetryAck {
+  int64 last_ack_ts_unix_ns = 1;
+}

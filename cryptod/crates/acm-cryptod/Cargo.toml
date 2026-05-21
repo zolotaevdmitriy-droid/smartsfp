@@ -1,0 +1,23 @@
+[package]
+name = "acm-cryptod"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ACM-UZ crypto datapath daemon. Runs on Smart SFP ISM4120I, encrypts TCP/IP traffic in bridge mode."
+
+[dependencies]
+acm-crypto = { path = "../acm-crypto" }
+acm-wire = { path = "../acm-wire" }
+acm-ipc = { path = "../acm-ipc" }
+acm-dpdk = { path = "../acm-dpdk" }
+
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[[bin]]
+name = "acm-cryptod"
+path = "src/main.rs"

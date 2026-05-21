@@ -1,0 +1,13 @@
+[package]
+name = "acm-wire"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ACM-UZ wire format: AEAD-framed packets with embedded AlgoId."
+
+[dependencies]
+acm-crypto = { path = "../acm-crypto" }
+anyhow.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
