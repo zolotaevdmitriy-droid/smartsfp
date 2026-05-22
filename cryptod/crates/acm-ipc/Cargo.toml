@@ -12,3 +12,9 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
+async-trait = "0.1"
+# Go's encoding/json serializes []byte as base64-standard string by default.
+# We match that on the wire so the Rust and Go sides interop without
+# special encoding gymnastics.
+base64 = "0.22"

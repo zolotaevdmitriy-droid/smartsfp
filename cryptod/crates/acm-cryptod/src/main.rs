@@ -8,15 +8,20 @@
 //! This file is the bootstrap skeleton. Real pipeline lives in worker
 //! threads pinned to a dedicated CPU core; see `acm-dpdk`.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::Parser;
+use tokio::sync::Mutex;
 use tracing::info;
 
 use acm_crypto::aes_gcm_ring::AesGcmRingProvider;
 use acm_crypto::aes_gcm_sw::AesGcmSwProvider;
 use acm_crypto::{AlgoId, CryptoProvider, KeyHandle};
+use acm_ipc::server::Handler;
+use acm_ipc::{Request, Response, StatusReport, DEFAULT_SOCKET_PATH};
 
 #[derive(Debug, Parser)]
 #[command(name = "acm-cryptod", version, about = "ACM-UZ crypto datapath", long_about = None)]
@@ -37,6 +42,10 @@ struct Cli {
     /// How many seconds to bench each block size in --bench mode.
     #[arg(long, default_value_t = 3)]
     bench_seconds: u64,
+
+    /// Unix domain socket path for control-plane IPC. Empty disables.
+    #[arg(long, default_value_t = DEFAULT_SOCKET_PATH.to_string())]
+    ipc_socket: String,
 }
 
 fn main() -> Result<()> {
@@ -61,22 +70,169 @@ fn main() -> Result<()> {
         return run_bench(cli.bench_seconds);
     }
 
-    info!(config = %cli.config, selftest = cli.selftest, "configuration");
-    info!("Hello, ACM-UZ. Pipeline not yet implemented.");
-
-    // TODO Phase 1: load config, initialize DPDK EAL, set up cryptodev_mvsam,
-    // bind gbe0/gbe1, start worker thread, start IPC server, signal handlers.
+    // For Phase 1 (no DPDK datapath yet), the daemon's job is to bring up
+    // the IPC server with a real crypto provider behind it. The agent can
+    // already exercise key rotation and status reads end-to-end.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        let state = Arc::new(CryptodState::new()?);
+        let socket = cli.ipc_socket.clone();
+        info!(socket = %socket, "starting IPC server");
+        acm_ipc::server::serve(socket, state).await?;
+        anyhow::Ok(())
+    })?;
 
     Ok(())
 }
 
+// ============================================================================
+// Cryptod state — what's held in memory and exposed via IPC.
+// ============================================================================
+
+struct CryptodState {
+    started_at: Instant,
+    // Active provider (ring AES-256-GCM by default, swap on RotateKey).
+    provider: Mutex<Box<dyn CryptoProvider>>,
+    active_algo: Mutex<AlgoId>,
+    active_key: Mutex<Option<KeyHandle>>,
+    // Counters incremented by the datapath; for Phase 1 only RotateKey /
+    // GetStatus paths touch them but the type is real.
+    packets_sealed: AtomicU64,
+    packets_opened: AtomicU64,
+    crypto_errors: AtomicU64,
+}
+
+impl CryptodState {
+    fn new() -> Result<Self> {
+        let default_algo = AlgoId::Aes256Gcm;
+        let provider = Box::new(AesGcmRingProvider::new(default_algo)?) as Box<dyn CryptoProvider>;
+        Ok(Self {
+            started_at: Instant::now(),
+            provider: Mutex::new(provider),
+            active_algo: Mutex::new(default_algo),
+            active_key: Mutex::new(None),
+            packets_sealed: AtomicU64::new(0),
+            packets_opened: AtomicU64::new(0),
+            crypto_errors: AtomicU64::new(0),
+        })
+    }
+
+    fn provider_name(&self, algo: AlgoId) -> String {
+        format!(
+            "ring/{}",
+            match algo {
+                AlgoId::Aes128Gcm => "aes-128-gcm",
+                AlgoId::Aes256Gcm => "aes-256-gcm",
+                AlgoId::OzDst1105 => "ozdst1105",
+            }
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl Handler for CryptodState {
+    async fn handle(&self, req: Request) -> Response {
+        match req {
+            Request::GetStatus => {
+                let algo = *self.active_algo.lock().await;
+                let key = self.active_key.lock().await;
+                Response::Status(StatusReport {
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    running: true,
+                    uptime_s: self.started_at.elapsed().as_secs(),
+                    active_provider: self.provider_name(algo),
+                    active_key_id: key.as_ref().map(|k| k.id),
+                    packets_sealed: self.packets_sealed.load(Ordering::Relaxed),
+                    packets_opened: self.packets_opened.load(Ordering::Relaxed),
+                    crypto_errors: self.crypto_errors.load(Ordering::Relaxed),
+                })
+            }
+            Request::RotateKey(p) => {
+                let new_algo = match AlgoId::from_u8(p.algo) {
+                    Some(a) => a,
+                    None => {
+                        return Response::Error {
+                            code: 422,
+                            message: format!("unknown algo: 0x{:02x}", p.algo),
+                        }
+                    }
+                };
+                let new_provider: Box<dyn CryptoProvider> = match new_algo {
+                    AlgoId::Aes128Gcm | AlgoId::Aes256Gcm => {
+                        match AesGcmRingProvider::new(new_algo) {
+                            Ok(p) => Box::new(p),
+                            Err(e) => {
+                                return Response::Error {
+                                    code: 500,
+                                    message: e.to_string(),
+                                }
+                            }
+                        }
+                    }
+                    AlgoId::OzDst1105 => {
+                        // Eventually: certified provider. For now,
+                        // explicitly unsupported so admin sees a clear
+                        // error rather than silent acceptance.
+                        return Response::Error {
+                            code: 501,
+                            message: "O'z DSt 1105 provider not yet implemented".into(),
+                        };
+                    }
+                };
+                let new_key = match KeyHandle::new(p.key_id, new_algo, p.material) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        return Response::Error {
+                            code: 422,
+                            message: e.to_string(),
+                        }
+                    }
+                };
+
+                // Self-test the new provider+key with a roundtrip on
+                // a small known plaintext before committing.
+                if let Err(e) = self_test(new_provider.as_ref(), &new_key) {
+                    return Response::Error {
+                        code: 500,
+                        message: format!("new key/provider failed self-test: {}", e),
+                    };
+                }
+
+                *self.provider.lock().await = new_provider;
+                *self.active_algo.lock().await = new_algo;
+                *self.active_key.lock().await = Some(new_key);
+                Response::Ok
+            }
+            Request::SetPolicy(_) => {
+                // Policy parsing TBD; we accept and ack for now.
+                Response::Ok
+            }
+        }
+    }
+}
+
+fn self_test(provider: &dyn CryptoProvider, key: &KeyHandle) -> Result<()> {
+    let algo = provider.algorithm();
+    let nonce = vec![0u8; algo.nonce_len()];
+    let pt = b"acm-uz-self-test";
+    let mut sealed = vec![0u8; pt.len() + algo.tag_len()];
+    let n = provider.seal(key, &nonce, b"", pt, &mut sealed)?;
+    let mut back = vec![0u8; pt.len()];
+    provider.open(key, &nonce, b"", &sealed[..n], &mut back)?;
+    if back != pt {
+        anyhow::bail!("self-test roundtrip mismatch");
+    }
+    Ok(())
+}
+
+// ============================================================================
+// Bench mode — unchanged from prior iteration.
+// ============================================================================
+
 /// Built-in micro-benchmark of the software AES-GCM provider.
-///
-/// Pinned to single thread (we don't spawn). Repeats `seal()` on a
-/// pre-allocated buffer for `duration_s` seconds per block size, then
-/// `open()` the same number of times. Output format mirrors
-/// `openssl speed -elapsed -evp aes-...-gcm` so two tables can be
-/// compared cell-by-cell.
 fn run_bench(duration_s: u64) -> Result<()> {
     let sizes: [usize; 6] = [16, 64, 256, 1024, 8192, 16384];
     let duration = Duration::from_secs(duration_s);
@@ -95,7 +251,6 @@ fn run_bench(duration_s: u64) -> Result<()> {
     println!();
 
     for algo in [AlgoId::Aes128Gcm, AlgoId::Aes256Gcm] {
-        // RustCrypto provider — KAT-reference
         bench_one(
             "rustcrypto",
             algo,
@@ -103,7 +258,6 @@ fn run_bench(duration_s: u64) -> Result<()> {
             &sizes,
             &AesGcmSwProvider::new(algo)?,
         )?;
-        // ring provider — HW AES on AArch64 stable
         bench_one(
             "ring      ",
             algo,
@@ -112,7 +266,6 @@ fn run_bench(duration_s: u64) -> Result<()> {
             &AesGcmRingProvider::new(algo)?,
         )?;
     }
-
     Ok(())
 }
 
@@ -128,70 +281,59 @@ fn bench_one(
     let aad: &[u8] = b"";
     let key_handle = KeyHandle::new(0, algo, key)?;
 
-    {
-        println!("=== {:?}  [{}] ===", algo, label.trim());
-        println!(
-            "{:>7}  {:>14}  {:>14}  {:>14}  {:>14}",
-            "block", "seal ops/s", "seal Mbps", "open ops/s", "open Mbps",
-        );
+    println!("=== {:?}  [{}] ===", algo, label.trim());
+    println!(
+        "{:>7}  {:>14}  {:>14}  {:>14}  {:>14}",
+        "block", "seal ops/s", "seal Mbps", "open ops/s", "open Mbps",
+    );
 
-        for &size in sizes {
-            let plaintext = vec![0u8; size];
-            let mut sealed = vec![0u8; size + algo.tag_len()];
-            let mut opened = vec![0u8; size];
+    for &size in sizes {
+        let plaintext = vec![0u8; size];
+        let mut sealed = vec![0u8; size + algo.tag_len()];
+        let mut opened = vec![0u8; size];
 
-            // ---- Seal benchmark ----
-            // Warmup ~50 ms to settle CPU caches / frequency.
-            let warm_end = Instant::now() + Duration::from_millis(50);
-            while Instant::now() < warm_end {
-                provider.seal(&key_handle, &nonce, aad, &plaintext, &mut sealed)?;
-            }
-
-            let mut seal_ops: u64 = 0;
-            let start = Instant::now();
-            while start.elapsed() < duration {
-                // Inner batch so we don't query the clock every iteration.
-                for _ in 0..256 {
-                    let n = provider.seal(&key_handle, &nonce, aad, &plaintext, &mut sealed)?;
-                    // black_box prevents the optimizer from eliding the
-                    // result usage.
-                    std::hint::black_box(n);
-                }
-                seal_ops += 256;
-            }
-            let seal_elapsed = start.elapsed();
-            let seal_ops_per_sec = seal_ops as f64 / seal_elapsed.as_secs_f64();
-            let seal_mbps = (seal_ops_per_sec * size as f64) * 8.0 / 1_000_000.0;
-
-            // ---- Open benchmark ----
-            // First produce one good sealed buffer to open repeatedly.
-            let n_ct = provider.seal(&key_handle, &nonce, aad, &plaintext, &mut sealed)?;
-
-            let warm_end = Instant::now() + Duration::from_millis(50);
-            while Instant::now() < warm_end {
-                provider.open(&key_handle, &nonce, aad, &sealed[..n_ct], &mut opened)?;
-            }
-
-            let mut open_ops: u64 = 0;
-            let start = Instant::now();
-            while start.elapsed() < duration {
-                for _ in 0..256 {
-                    let n = provider.open(&key_handle, &nonce, aad, &sealed[..n_ct], &mut opened)?;
-                    std::hint::black_box(n);
-                }
-                open_ops += 256;
-            }
-            let open_elapsed = start.elapsed();
-            let open_ops_per_sec = open_ops as f64 / open_elapsed.as_secs_f64();
-            let open_mbps = (open_ops_per_sec * size as f64) * 8.0 / 1_000_000.0;
-
-            println!(
-                "{:>5} B  {:>14.0}  {:>11.1} Mb/s  {:>14.0}  {:>11.1} Mb/s",
-                size, seal_ops_per_sec, seal_mbps, open_ops_per_sec, open_mbps,
-            );
+        // Seal
+        let warm_end = Instant::now() + Duration::from_millis(50);
+        while Instant::now() < warm_end {
+            provider.seal(&key_handle, &nonce, aad, &plaintext, &mut sealed)?;
         }
-        println!();
-    }
+        let mut seal_ops: u64 = 0;
+        let start = Instant::now();
+        while start.elapsed() < duration {
+            for _ in 0..256 {
+                let n = provider.seal(&key_handle, &nonce, aad, &plaintext, &mut sealed)?;
+                std::hint::black_box(n);
+            }
+            seal_ops += 256;
+        }
+        let seal_elapsed = start.elapsed();
+        let seal_ops_per_sec = seal_ops as f64 / seal_elapsed.as_secs_f64();
+        let seal_mbps = (seal_ops_per_sec * size as f64) * 8.0 / 1_000_000.0;
 
+        // Open
+        let n_ct = provider.seal(&key_handle, &nonce, aad, &plaintext, &mut sealed)?;
+        let warm_end = Instant::now() + Duration::from_millis(50);
+        while Instant::now() < warm_end {
+            provider.open(&key_handle, &nonce, aad, &sealed[..n_ct], &mut opened)?;
+        }
+        let mut open_ops: u64 = 0;
+        let start = Instant::now();
+        while start.elapsed() < duration {
+            for _ in 0..256 {
+                let n = provider.open(&key_handle, &nonce, aad, &sealed[..n_ct], &mut opened)?;
+                std::hint::black_box(n);
+            }
+            open_ops += 256;
+        }
+        let open_elapsed = start.elapsed();
+        let open_ops_per_sec = open_ops as f64 / open_elapsed.as_secs_f64();
+        let open_mbps = (open_ops_per_sec * size as f64) * 8.0 / 1_000_000.0;
+
+        println!(
+            "{:>5} B  {:>14.0}  {:>11.1} Mb/s  {:>14.0}  {:>11.1} Mb/s",
+            size, seal_ops_per_sec, seal_mbps, open_ops_per_sec, open_mbps,
+        );
+    }
+    println!();
     Ok(())
 }

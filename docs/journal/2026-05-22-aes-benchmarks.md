@@ -398,3 +398,101 @@ ring 1024 B open = 1633 Мбит/с (vs seal 1815), на 10% медленнее.
 * Залит `acm-cryptod` (1.18 МБ) в `/home/user/acm-uz/acm-cryptod` —
   идёт от user, никаких прав не требует.
 
+## Шаг 9 — UDS-сервер в `acm-cryptod` + клиент в `acm-cli` (Go)
+
+Цель: end-to-end проверить, что Rust-демон и Go-клиент договариваются
+по контролю крипто-состояния через Unix Domain Socket.
+
+### Архитектура
+
+* **Wire:** line-delimited JSON, один запрос на строку, один ответ.
+  Просто, debug'ается через `nc -U`. Контракт описан в `acm-ipc`
+  (Rust) и продублирован в `agent/internal/ipc/client.go`.
+* **Сервер:** в `acm-ipc::server` — общий tokio-based UDS listener
+  с trait `Handler`. Один поток per connection.
+* **State:** в `acm-cryptod::CryptodState` — держит активный
+  `Box<dyn CryptoProvider>` + `KeyHandle`, на `RotateKey` создаёт
+  новый провайдер и перед коммитом гоняет self-test (seal+open
+  одного известного PT).
+
+### Грабли interop №1 — Go vs Rust JSON для `[]byte`
+
+Первый прогон упал на rotate-key:
+
+    cryptod error 400: bad request json: invalid type: string
+    "1bGyauGWLw0GDEpQSUtc+LfitOdFfBdYy2Moo0UVuFo=",
+    expected a sequence at line 1 column 110
+
+Go `encoding/json` сериализует `[]byte` как **base64-standard string**
+по умолчанию. Rust `serde_json` для `Vec<u8>` ожидает **массив чисел**.
+Это классическая interop-беда между двумя экосистемами.
+
+**Решение:** на Rust-стороне явный custom serde для поля `material`:
+
+```rust
+#[serde(with = "wire_b64")]
+pub material: Vec<u8>,
+
+mod wire_b64 {
+    pub fn serialize<S: Serializer>(b: &Vec<u8>, s: S) -> ...;
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, ...>;
+}
+```
+
+Один новый dep: `base64 = "0.22"` в `acm-ipc/Cargo.toml`. Два теста
+в `acm-ipc`: `serialize_rotate_key_uses_base64` и
+`deserialize_rotate_key_from_base64` фиксируют контракт навсегда.
+
+### Грабли №2 — `async-trait` нужно в каждом crate, где импл
+
+`acm_ipc::server::Handler` декорирован `#[async_trait::async_trait]`.
+Когда в `acm-cryptod` пишем `impl Handler for CryptodState`, тоже
+нужен `async_trait` crate в Cargo.toml — он не достаётся транзитивно
+через `acm-ipc`. Добавил в `acm-cryptod/Cargo.toml`.
+
+### End-to-end smoke на модуле (`scripts/test_ipc_on_module.py`)
+
+Скрипт:
+1. Заливает свежие `acm-cryptod` + `acm-cli` через SFTP.
+2. Запускает `cryptod --ipc-socket /tmp/acm/cryptod.sock` в фоне
+   (никакого root — UDS в `/tmp`).
+3. Ждёт появления сокета (≤5 сек).
+4. Прогоняет 4 операции через `acm-cli` (Go-клиент) к cryptod
+   (Rust-серверу) и проверяет ответы:
+
+| # | Операция | Ожидание | Получили |
+|---|---|---|---|
+| 1 | `acm-cli status` | active_key_id=(none), version 0.1.0, provider ring/aes-256-gcm | ✅ |
+| 2 | `acm-cli rotate-key 7 2 <32B hex>` | "ok" | ✅ |
+| 3 | `acm-cli status` ещё раз | active_key_id=7 | ✅ |
+| 4 | `acm-cli rotate-key 8 0x10 <32B hex>` (O'z DSt 1105 — не поддержан) | exit≠0 + ошибка 501 | ✅ "cryptod error 501: O'z DSt 1105 provider not yet implemented" |
+
+Все 4 assertions прошли. Это **первое реальное end-to-end
+подтверждение**, что:
+- Rust-cryptod на ISM4120I принимает контроль от Go-клиента через UDS;
+- ротация ключа реально меняет активный провайдер;
+- ошибки маршалятся читаемо.
+
+### Изменения состояния модуля
+
+* `/home/user/acm-uz/acm-cryptod` (1.45 МБ) — свежий бинарь с IPC-server'ом;
+* `/home/user/acm-uz/acm-cli` (2.42 МБ) — Go-CLI с IPC-клиентом;
+* `/tmp/acm/cryptod.log` и `/tmp/acm/cryptod.sock` (последний после
+  теста удалён);
+* Процесс `acm-cryptod` после теста убит `pkill`.
+
+## Итоги дня 2 (обновлённые)
+
+* ✅ AES-256-GCM в Rust через `ring` даёт **1815 Мбит/с** на 1KB-блоках
+  (1.5× быстрее openssl CLI). Подтверждено на ISM4120I.
+* ✅ RustCrypto `aes-gcm` на stable AArch64 → bitsliced software AES,
+  10× медленнее. Документировано.
+* ✅ Wire-формат с `AlgoId`, header-as-AAD, 11 тестов.
+* ✅ UDS control plane: cryptod (Rust+tokio) ↔ agent/cli (Go), JSON over UDS,
+  ротация ключа, self-test перед коммитом, аккуратные ошибки.
+* ✅ Документировано в журнале каждое решение, каждая грабля, каждое
+  изменение состояния модуля.
+* 🔜 **Что следующее:** интегрировать `acm-wire::seal/open` поверх IPC
+  (положить туда тестовый поток), счётчики `packets_sealed/opened`
+  начнут расти; затем — Prometheus exporter в agent + bridge к UDS.
+
