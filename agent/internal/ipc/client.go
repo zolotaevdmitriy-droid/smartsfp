@@ -36,6 +36,21 @@ type rotateKeyParams struct {
 	Material []byte `json:"material"`
 }
 
+type encryptParams struct {
+	Nonce     []byte `json:"nonce"`
+	AAD       []byte `json:"aad,omitempty"`
+	Plaintext []byte `json:"plaintext"`
+}
+
+type decryptParams struct {
+	Frame []byte `json:"frame"`
+}
+
+// bytesPayload mirrors acm-ipc::Bytes (base64-on-wire).
+type bytesPayload struct {
+	Bytes []byte `json:"bytes"`
+}
+
 // -- Response side -------------------------------------------------------
 
 type responseEnvelope struct {
@@ -166,6 +181,63 @@ func (c *Client) GetStatus(ctx context.Context) (*StatusReport, error) {
 			return nil, fmt.Errorf("decode status: %w", err)
 		}
 		return &s, nil
+	case "error":
+		var e ErrorResponse
+		_ = json.Unmarshal(env.Data, &e)
+		return nil, &e
+	default:
+		return nil, fmt.Errorf("unexpected response shape: %s", env.Result)
+	}
+}
+
+// Encrypt sends `plaintext` to cryptod, returns the full ACM-wire frame
+// (header + nonce + ciphertext + tag) ready to be sent to a peer.
+//
+// `nonce` must be exactly 12 bytes (AES-GCM); caller is responsible for
+// uniqueness per (key_id, nonce). `aad` may be nil.
+func (c *Client) Encrypt(ctx context.Context, nonce, aad, plaintext []byte) ([]byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	params, _ := json.Marshal(encryptParams{Nonce: nonce, AAD: aad, Plaintext: plaintext})
+	env, err := c.roundtrip(ctx, request{Method: "encrypt", Params: params})
+	if err != nil {
+		return nil, err
+	}
+	switch env.Result {
+	case "ciphertext":
+		var b bytesPayload
+		if err := json.Unmarshal(env.Data, &b); err != nil {
+			return nil, fmt.Errorf("decode ciphertext: %w", err)
+		}
+		return b.Bytes, nil
+	case "error":
+		var e ErrorResponse
+		_ = json.Unmarshal(env.Data, &e)
+		return nil, &e
+	default:
+		return nil, fmt.Errorf("unexpected response shape: %s", env.Result)
+	}
+}
+
+// Decrypt feeds a full ACM-wire frame to cryptod, returns the plaintext.
+// Returns ErrorResponse with Code == 401 on authentication failure.
+func (c *Client) Decrypt(ctx context.Context, frame []byte) ([]byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	params, _ := json.Marshal(decryptParams{Frame: frame})
+	env, err := c.roundtrip(ctx, request{Method: "decrypt", Params: params})
+	if err != nil {
+		return nil, err
+	}
+	switch env.Result {
+	case "plaintext":
+		var b bytesPayload
+		if err := json.Unmarshal(env.Data, &b); err != nil {
+			return nil, fmt.Errorf("decode plaintext: %w", err)
+		}
+		return b.Bytes, nil
 	case "error":
 		var e ErrorResponse
 		_ = json.Unmarshal(env.Data, &e)

@@ -72,6 +72,8 @@ case "$cmd" in
           -o ../dist/acm-agent ./cmd/acm-agent
       GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" \
           -o ../dist/acm-cli ./cmd/acm-cli
+      GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" \
+          -o ../dist/acm-encdec-test ./cmd/acm-encdec-test
       cd ..
 
       echo "=== Build controller (amd64) ==="

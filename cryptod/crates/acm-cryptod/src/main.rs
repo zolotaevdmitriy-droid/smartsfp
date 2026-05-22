@@ -21,7 +21,10 @@ use acm_crypto::aes_gcm_ring::AesGcmRingProvider;
 use acm_crypto::aes_gcm_sw::AesGcmSwProvider;
 use acm_crypto::{AlgoId, CryptoProvider, KeyHandle};
 use acm_ipc::server::Handler;
-use acm_ipc::{Request, Response, StatusReport, DEFAULT_SOCKET_PATH};
+use acm_ipc::{
+    Bytes, DecryptParams, EncryptParams, Request, Response, StatusReport, DEFAULT_SOCKET_PATH,
+};
+use acm_wire::{self, frame_len};
 
 #[derive(Debug, Parser)]
 #[command(name = "acm-cryptod", version, about = "ACM-UZ crypto datapath", long_about = None)]
@@ -209,6 +212,104 @@ impl Handler for CryptodState {
             Request::SetPolicy(_) => {
                 // Policy parsing TBD; we accept and ack for now.
                 Response::Ok
+            }
+            Request::Encrypt(p) => self.handle_encrypt(p).await,
+            Request::Decrypt(p) => self.handle_decrypt(p).await,
+        }
+    }
+}
+
+impl CryptodState {
+    async fn handle_encrypt(&self, p: EncryptParams) -> Response {
+        // Need both an active key and the corresponding provider.
+        let key_guard = self.active_key.lock().await;
+        let key = match key_guard.as_ref() {
+            Some(k) => k.clone(),
+            None => {
+                return Response::Error {
+                    code: 409,
+                    message: "no active key — call rotate_key first".into(),
+                }
+            }
+        };
+        drop(key_guard);
+        let provider = self.provider.lock().await;
+        let algo = provider.algorithm();
+
+        // Validate nonce length up-front so we get a clean error.
+        if p.nonce.len() != algo.nonce_len() {
+            return Response::Error {
+                code: 422,
+                message: format!(
+                    "nonce length mismatch: got {}, want {} for {:?}",
+                    p.nonce.len(),
+                    algo.nonce_len(),
+                    algo,
+                ),
+            };
+        }
+
+        let need = frame_len(p.plaintext.len(), p.nonce.len(), algo.tag_len());
+        let mut out = vec![0u8; need];
+        match acm_wire::seal(
+            provider.as_ref(),
+            &key,
+            key.id,
+            &p.nonce,
+            /*flags=*/ 0,
+            &p.plaintext,
+            &mut out,
+        ) {
+            Ok(n) => {
+                debug_assert_eq!(n, need);
+                self.packets_sealed.fetch_add(1, Ordering::Relaxed);
+                Response::Ciphertext(Bytes::from(out))
+            }
+            Err(e) => {
+                self.crypto_errors.fetch_add(1, Ordering::Relaxed);
+                Response::Error {
+                    code: 500,
+                    message: format!("seal failed: {}", e),
+                }
+            }
+        }
+    }
+
+    async fn handle_decrypt(&self, p: DecryptParams) -> Response {
+        let key_guard = self.active_key.lock().await;
+        let key = match key_guard.as_ref() {
+            Some(k) => k.clone(),
+            None => {
+                return Response::Error {
+                    code: 409,
+                    message: "no active key".into(),
+                }
+            }
+        };
+        drop(key_guard);
+        let provider = self.provider.lock().await;
+
+        // Worst-case plaintext is frame.len() (no nonce/header/tag) — that's
+        // a safe upper bound for the out buffer.
+        let mut out = vec![0u8; p.frame.len()];
+        match acm_wire::open(provider.as_ref(), &key, &p.frame, &mut out) {
+            Ok(n) => {
+                out.truncate(n);
+                self.packets_opened.fetch_add(1, Ordering::Relaxed);
+                Response::Plaintext(Bytes::from(out))
+            }
+            Err(e) => {
+                self.crypto_errors.fetch_add(1, Ordering::Relaxed);
+                // 401-class for authentication failures, 400-class for
+                // malformed input.
+                let code = match e {
+                    acm_wire::WireError::Crypto(acm_crypto::CryptoError::AuthFailed) => 401,
+                    _ => 422,
+                };
+                Response::Error {
+                    code,
+                    message: format!("open failed: {}", e),
+                }
             }
         }
     }

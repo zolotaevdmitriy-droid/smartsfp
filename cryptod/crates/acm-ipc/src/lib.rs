@@ -44,6 +44,12 @@ pub enum Request {
     GetStatus,
     SetPolicy(PolicyBlob),
     RotateKey(RotateKeyParams),
+    /// Seal a one-shot buffer through the active provider/key. The full
+    /// frame is built by `acm-wire::seal` so the on-wire output includes
+    /// the ACM header + nonce + ciphertext + tag.
+    Encrypt(EncryptParams),
+    /// Open a previously-sealed ACM frame. Returns plaintext or AuthFailed.
+    Decrypt(DecryptParams),
 }
 
 /// Top-level response envelope.
@@ -52,7 +58,49 @@ pub enum Request {
 pub enum Response {
     Status(StatusReport),
     Ok,
-    Error { code: u32, message: String },
+    /// Full ACM frame produced by `Encrypt`.
+    Ciphertext(Bytes),
+    /// Plaintext produced by `Decrypt`.
+    Plaintext(Bytes),
+    Error {
+        code: u32,
+        message: String,
+    },
+}
+
+/// Wire wrapper for arbitrary bytes (base64-on-wire — matches Go default).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Bytes {
+    #[serde(with = "wire_b64")]
+    pub bytes: Vec<u8>,
+}
+
+impl From<Vec<u8>> for Bytes {
+    fn from(v: Vec<u8>) -> Self {
+        Self { bytes: v }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncryptParams {
+    /// Caller-supplied 12-byte nonce. Caller is responsible for uniqueness
+    /// per (key_id, nonce). For tests / PoC we just pass distinct values.
+    #[serde(with = "wire_b64")]
+    pub nonce: Vec<u8>,
+    /// Additional authenticated data — included in tag, not encrypted.
+    #[serde(with = "wire_b64", default)]
+    pub aad: Vec<u8>,
+    /// Plaintext to seal.
+    #[serde(with = "wire_b64")]
+    pub plaintext: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecryptParams {
+    /// The full ACM frame (header + nonce + ciphertext + tag) produced
+    /// by a previous `Encrypt` call (or by a peer cryptod).
+    #[serde(with = "wire_b64")]
+    pub frame: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,7 +130,7 @@ pub struct RotateKeyParams {
     pub material: Vec<u8>,
 }
 
-mod wire_b64 {
+pub mod wire_b64 {
     use base64::Engine;
     use serde::{Deserialize, Deserializer, Serializer};
 

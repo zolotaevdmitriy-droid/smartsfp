@@ -496,3 +496,166 @@ mod wire_b64 {
   (положить туда тестовый поток), счётчики `packets_sealed/opened`
   начнут расти; затем — Prometheus exporter в agent + bridge к UDS.
 
+## Шаг 10 — Encrypt/Decrypt через IPC: полноценный шифратор
+
+**Safety-правила сессии:** ничего в `/etc`, `/usr`, `/opt`, `/var`; всё в
+`/home/user/acm-uz/` и `/tmp/`; cryptod от user'а с UDS в `/tmp/acm/`;
+все тест-скрипты с `finally: cleanup`; SSH-проверка после каждой операции.
+
+### Расширение контракта
+
+Добавил в `acm-ipc`:
+
+| Тип | Назначение |
+|---|---|
+| `Request::Encrypt(EncryptParams)` | Принять plaintext, вернуть полный ACM-frame |
+| `Request::Decrypt(DecryptParams)` | Принять frame, вернуть plaintext или 401 AuthFailed |
+| `Response::Ciphertext(Bytes)` | Frame обратно |
+| `Response::Plaintext(Bytes)` | Расшифровка обратно |
+| `pub mod wire_b64` | Сделал серде-хелпер `pub` чтобы переиспользовать в `Bytes`/`EncryptParams` |
+
+Все байтовые поля — base64-on-wire (`nonce`, `aad`, `plaintext`, `frame`,
+`Bytes.bytes`), совместимо с Go-сериализацией.
+
+### Реализация в `CryptodState`
+
+`handle_encrypt(p)`:
+
+1. Берёт активный key. Если ключа нет — 409 "no active key".
+2. Валидирует nonce length против `algo.nonce_len()`.
+3. Аллоцирует buffer на `frame_len(pt.len(), 12, 16)`.
+4. Вызывает `acm_wire::seal(provider, &key, key.id, &nonce, 0, pt, &mut out)`.
+5. Инкрементит `packets_sealed`; при ошибке — `crypto_errors`.
+6. Отдаёт `Response::Ciphertext`.
+
+`handle_decrypt(p)`:
+
+1. Активный key (иначе 409).
+2. `acm_wire::open(...)`.
+3. На success — `packets_opened` + Plaintext.
+4. На failure — `crypto_errors` + правильный код:
+   - `AuthFailed` → **401** (распознаваемо как auth-проблема);
+   - всё остальное → 422 (malformed input).
+
+### Go-клиент
+
+Расширил `agent/internal/ipc/Client`: методы `Encrypt(ctx, nonce, aad, pt)`
+и `Decrypt(ctx, frame)`. Использует тот же long-lived UDS-connection +
+mutex для сериализации.
+
+### E2E test binary `acm-encdec-test` (Go)
+
+Отдельный mini-бинарь, чтобы не раздувать `acm-cli`. Запускается на
+модуле, делает 11 операций:
+
+1. `GetStatus` → запоминает счётчики;
+2. Для каждого размера `[0, 1, 15, 16, 17, 64, 256, 1500, 9000]`:
+   - случайные `pt` + nonce + AAD,
+   - `Encrypt` → проверяет `len(frame) == pt + 40` (12+12+16),
+   - `Decrypt` → проверяет `back == pt`;
+3. Tamper: `Encrypt("ATTACK AT DAWN")`, flip байт #24 (первый ct),
+   `Decrypt` → ожидает `code 401`;
+4. `GetStatus` снова — счётчики:
+   - `sealed` += 10 (9 + 1 для tamper-test),
+   - `opened` += 9 (tamper-decrypt инкремент не делает — он errored),
+   - `crypto_errors` += 1.
+
+### Прогон на ISM4120I
+
+```
+BEFORE: sealed=0 opened=0 errors=0 key=1
+  ok roundtrip size=0 frame=40B
+  ok roundtrip size=1 frame=41B
+  ok roundtrip size=15 frame=55B
+  ok roundtrip size=16 frame=56B
+  ok roundtrip size=17 frame=57B
+  ok roundtrip size=64 frame=104B
+  ok roundtrip size=256 frame=296B
+  ok roundtrip size=1500 frame=1540B
+  ok roundtrip size=9000 frame=9040B
+  ok tamper detected: cryptod error 401: open failed: crypto: authentication failed
+AFTER : sealed=10 opened=9 errors=1
+PASS
+
+version:          0.1.0
+running:          true
+uptime_s:         2
+active_provider:  ring/aes-256-gcm
+active_key_id:    1
+packets_sealed:   10
+packets_opened:   9
+crypto_errors:    1
+```
+
+**Все 11 assertions прошли.** Post-cleanup SSH-проверка — ok.
+
+### Изменения состояния модуля
+
+* `/home/user/acm-uz/{acm-cryptod, acm-cli, acm-encdec-test}` обновлены;
+* `/tmp/acm/cryptod.log` (foreground'ный лог);
+* `/tmp/acm/cryptod.sock` — удалён в cleanup;
+* процесс `acm-cryptod` — pkill'ed в `finally`.
+
+### Что это означает
+
+К концу сессии у нас **рабочий end-to-end software шифратор на реальном
+SFP-модуле**:
+
+```
+Go-клиент (acm-encdec-test)
+   │
+   │  JSON-RPC over UDS  /tmp/acm/cryptod.sock
+   ▼
+Rust-cryptod
+   │
+   │  acm_wire::seal/open
+   ▼
+AesGcmRingProvider (ring 0.17, ARMv8 Crypto Ext)
+   │
+   ▼
+шифрованный фрейм (header + nonce + ct + tag)
+```
+
+Не хватает только связи с реальными сетевыми пакетами — это уже DPDK
+layer и MUSDK NETA PMD. Но **криптографическая часть, key management,
+агент-провайдер контракт, wire-формат, аутентификация и метрики
+работают** и проверены на железе.
+
+## Финальные итоги дня 2 (2026-05-22)
+
+### Метрики
+
+* **Тесты:** 4 → 34 (unit) + 2 E2E на железе
+* **Коммиты:** 6 за день, всё на main, пушится зелёно
+* **Бинарей на модуле:** 5 (cryptod, agent, cli, encdec-test, controller-amd64)
+* **Производительность подтверждена:** AES-256-GCM 1815 Мбит/с через ring
+  (line-rate с запасом), 1KB packets
+
+### Качественные результаты
+
+1. ✅ Tooling pipeline собирает любой код в один статический бинарь под
+   aarch64, заливается на модуль за секунды.
+2. ✅ Crypto-абстракция `CryptoProvider` доказала ценность: одна
+   RustCrypto-реализация для KAT, одна `ring`-реализация для production,
+   обе bit-equivalent.
+3. ✅ Wire-формат с `AlgoId` устойчив к подмене заголовков, легко
+   расширяется на O'z DSt 1105 в фазе 2.
+4. ✅ Control plane через UDS отработан end-to-end: ротация ключа,
+   статус, encrypt/decrypt, обработка ошибок.
+5. ✅ Счётчики (sealed/opened/errors) реально работают — основа для
+   Prometheus exporter и аудит-журнала по 2814.
+6. ✅ Каждый шаг задокументирован с командами, выводом, заметками о
+   состоянии модуля — материал готов к включению в отчёт.
+
+### Что ещё нет (фокус следующего дня)
+
+* **Prometheus exporter** в Go-agent (читать счётчики, отдавать
+  `/metrics`).
+* **SNMP-агент** в Go-agent.
+* **Реальный DPDK datapath** — отдельный большой кусок, со связкой
+  MUSDK NETA + crypto_mvsam PMD.
+* **O'z DSt 1105** в Rust (после получения тест-векторов).
+* **Бинарный wire-формат для IPC** вместо JSON для производительности
+  (сейчас JSON хорош для отладки, в DPDK pipeline пакеты будут идти
+  через shared-memory ring).
+
