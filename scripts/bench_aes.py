@@ -1,34 +1,38 @@
 """
-Прогнать бенчмарки AES на ISM4120I через jumphost.
-Использует sudo с паролем (тот же что и для user).
+Бенчмарки AES на ISM4120I.
 
-Что делает:
-  1. Проверяет / устанавливает openssl CLI (apt install — единственное
-     изменение состояния модуля).
-  2. openssl speed -evp aes-128-gcm / aes-256-gcm / chacha20-poly1305
-     — потолок программного AES через ARM Crypto Extensions.
-  3. musdk_sam_kat для AES-128-GCM с разными размерами буфера — потолок
-     HW-ускорителя SAM.
-  4. Кладёт raw-вывод обоих в scripts/output/bench-YYYYMMDD-*.txt
-     (в .gitignore).
+Логин: ssh user@192.168.0.99 (через jumphost), потом `su -c '...'` с root
+паролем (PleaseChangeTheRootPassword). У `su` требуется TTY → используем
+PTY-канал paramiko и подаём пароль в stdin.
 
-Скрипт сам ничего не парсит — это делает человек / отдельный скрипт.
+Запуск:
+    python scripts/bench_aes.py
+
+Полный raw-лог пишется в scripts/output/bench-YYYYMMDD-HHMMSS.txt
+(каталог output/ в .gitignore).
 """
 import os
+import re
 import sys
 import time
+import shlex
 import datetime as dt
 import paramiko
 
 JUMP_HOST, JUMP_USER, JUMP_PASS = "178.104.223.171", "root", "Cfvgbxn38"
 TARGET_HOST, TARGET_PORT = "192.168.0.99", 22
 TARGET_USER, TARGET_PASS = "user", "PleaseChangeTheUserPassword"
+ROOT_PASS = "PleaseChangeTheRootPassword"
 
 OUT_DIR = os.path.join(os.path.dirname(__file__), "output")
 os.makedirs(OUT_DIR, exist_ok=True)
 STAMP = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+LOG_PATH = os.path.join(OUT_DIR, f"bench-{STAMP}.txt")
 
 
+# ----------------------------------------------------------------
+# SSH plumbing
+# ----------------------------------------------------------------
 def connect():
     jc = paramiko.SSHClient()
     jc.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -44,130 +48,212 @@ def connect():
     return jc, tc
 
 
-def run(tc, cmd, timeout=60, sudo=False):
-    """Run a command, return (rc, stdout, stderr). For sudo, password is
-    fed via stdin (sudo -S)."""
-    full = f"sudo -S -p '' bash -c {shell_quote(cmd)}" if sudo else cmd
-    stdin, stdout, stderr = tc.exec_command(full, timeout=timeout)
-    if sudo:
-        stdin.write(TARGET_PASS + "\n")
-        stdin.flush()
+def run_user(tc, cmd, timeout=60):
+    """Plain exec_command under `user`. Returns (rc, stdout, stderr)."""
+    stdin, stdout, stderr = tc.exec_command(cmd, timeout=timeout)
     out = stdout.read().decode(errors="replace")
     err = stderr.read().decode(errors="replace")
     rc = stdout.channel.recv_exit_status()
     return rc, out, err
 
 
-def shell_quote(s):
-    return "'" + s.replace("'", "'\"'\"'") + "'"
+def run_root(tc, cmd, timeout=120):
+    """
+    Execute `cmd` as root via `su -c`. Returns (rc, output).
+
+    Uses PTY because Debian 12's `su` requires a TTY for password input.
+    After password prompt, everything up to and including the prompt line
+    is stripped from the output. stderr is merged into stdout.
+    """
+    su_line = f"su -c {shlex.quote(cmd)}"
+    chan = tc.get_transport().open_session()
+    chan.settimeout(timeout + 5)
+    chan.get_pty(term="dumb", width=200, height=50)
+    chan.exec_command(su_line)
+
+    buf = bytearray()
+    sent_pw = False
+    start = time.time()
+    while True:
+        # Read available data without blocking; tiny sleep otherwise.
+        if chan.recv_ready():
+            data = chan.recv(16384)
+            if data:
+                buf.extend(data)
+        # Detect password prompt the first time and send the password.
+        if not sent_pw and b"assword:" in buf:
+            chan.send(ROOT_PASS + "\n")
+            sent_pw = True
+        # Detect end-of-command (exit status + no more data buffered).
+        if chan.exit_status_ready() and not chan.recv_ready():
+            # One more drain pass.
+            time.sleep(0.05)
+            while chan.recv_ready():
+                buf.extend(chan.recv(16384))
+            break
+        if time.time() - start > timeout:
+            chan.close()
+            raise TimeoutError(f"root cmd timed out after {timeout}s: {cmd!r}")
+        time.sleep(0.03)
+
+    rc = chan.recv_exit_status()
+    text = buf.decode(errors="replace")
+    # Strip "Password:" prompt line — everything up to first newline after
+    # the literal "Password:" word.
+    text = re.sub(r"(?s)^.*?[Pp]assword:[^\r\n]*\r?\n", "", text, count=1)
+    # If su itself failed (wrong password), nothing was stripped — but
+    # then we'd see "su: Authentication failure" in the output. Trust the
+    # caller to inspect rc.
+    return rc, text
 
 
+# ----------------------------------------------------------------
+# Logger
+# ----------------------------------------------------------------
 def section(title):
     line = "=" * 78
     return f"\n{line}\n  {title}\n{line}\n"
 
 
-def dump(title, cmd, rc, out, err):
-    blocks = [section(title), f"$ {cmd}", f"exit={rc}", ""]
+class Log:
+    def __init__(self, path):
+        self.path = path
+        self.fh = open(path, "w", encoding="utf-8")
+
+    def write(self, block):
+        self.fh.write(block)
+        self.fh.flush()
+
+    def close(self):
+        self.fh.close()
+
+
+def record(log, label, cmd, rc, out, err="", dur=None):
+    head = f"{label}"
+    if dur is not None:
+        head += f"  ({dur:.1f}s)"
+    blocks = [section(head), f"$ {cmd}", f"exit={rc}", ""]
     if out:
         blocks.append("--- stdout ---")
         blocks.append(out.rstrip())
     if err:
         blocks.append("--- stderr ---")
         blocks.append(err.rstrip())
-    return "\n".join(blocks) + "\n"
+    log.write("\n".join(blocks) + "\n")
 
 
+# ----------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------
 def main():
     print(f"[*] connect…")
     jc, tc = connect()
     print(f"[+] {TARGET_USER}@{TARGET_HOST}")
+    log = Log(LOG_PATH)
 
-    log_path = os.path.join(OUT_DIR, f"bench-{STAMP}.txt")
-    log = open(log_path, "w", encoding="utf-8")
-
-    def step(title, cmd, *, sudo=False, timeout=600, echo_lines=20):
-        print(f"[*] {title}")
+    def step_user(label, cmd, timeout=60, echo=15):
+        print(f"[*] {label}")
         t0 = time.time()
-        rc, out, err = run(tc, cmd, timeout=timeout, sudo=sudo)
+        rc, out, err = run_user(tc, cmd, timeout=timeout)
         dur = time.time() - t0
-        block = dump(f"{title}  ({dur:.1f}s)", cmd, rc, out, err)
-        log.write(block)
-        log.flush()
-        # Эхо в консоль (короткое)
-        printable = (out or err).rstrip().splitlines()
+        record(log, label, cmd, rc, out, err, dur)
+        lines = (out or err).rstrip().splitlines()
         print(f"    rc={rc} time={dur:.1f}s")
-        for ln in printable[:echo_lines]:
+        for ln in lines[:echo]:
             print(f"    | {ln}")
-        if len(printable) > echo_lines:
-            print(f"    | ... ({len(printable)-echo_lines} more lines in log)")
+        if len(lines) > echo:
+            print(f"    | ... ({len(lines)-echo} more lines in log)")
         return rc, out, err
 
-    # ----------------------------------------------------------------
-    # 0. Sanity: identify module + sudo works
-    # ----------------------------------------------------------------
-    step("uname / cpuinfo", "uname -a; grep -m1 Features /proc/cpuinfo; free -m | head -2")
-    step("whoami without sudo", "whoami")
-    step("whoami via sudo", "whoami", sudo=True, echo_lines=3)
+    def step_root(label, cmd, timeout=180, echo=15):
+        print(f"[*] {label}  (root)")
+        t0 = time.time()
+        try:
+            rc, out = run_root(tc, cmd, timeout=timeout)
+        except TimeoutError as e:
+            rc, out = -1, str(e)
+        dur = time.time() - t0
+        record(log, label + "  [root]", cmd, rc, out, dur=dur)
+        lines = out.rstrip().splitlines()
+        print(f"    rc={rc} time={dur:.1f}s")
+        for ln in lines[:echo]:
+            print(f"    | {ln}")
+        if len(lines) > echo:
+            print(f"    | ... ({len(lines)-echo} more lines in log)")
+        return rc, out
 
     # ----------------------------------------------------------------
-    # 1. Install openssl CLI (if missing)
+    # 0. Sanity: user identity + root via su works
     # ----------------------------------------------------------------
-    rc, out, _ = run(tc, "command -v openssl")
-    if rc != 0:
-        step("apt update", "DEBIAN_FRONTEND=noninteractive apt-get update -qq",
-             sudo=True, timeout=180, echo_lines=5)
-        step("apt install openssl", "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssl",
-             sudo=True, timeout=180, echo_lines=10)
+    step_user("sanity / whoami as user", "whoami; id")
+    rc, out = step_root("sanity / whoami as root", "whoami && id && hostname")
+    if "root" not in out:
+        print("\n[!] su to root did not succeed. Output above.")
+        log.close()
+        sys.exit(2)
+
+    # ----------------------------------------------------------------
+    # 1. Install openssl CLI if missing (apt update + apt install)
+    # ----------------------------------------------------------------
+    rc_u, out_u, _ = run_user(tc, "command -v openssl")
+    if rc_u != 0:
+        step_root("apt-get update",
+                  "DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>&1",
+                  timeout=240, echo=5)
+        step_root("apt-get install openssl",
+                  "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssl 2>&1",
+                  timeout=240, echo=10)
     else:
-        log.write(section("openssl CLI already present") + out + "\n")
-        print("[+] openssl already installed")
+        log.write(section("openssl CLI already installed") + out_u + "\n")
+        print("[+] openssl CLI already present")
 
-    step("openssl version", "openssl version -a")
-
-    # ----------------------------------------------------------------
-    # 2. openssl speed — пробежать ключевые AEAD / cipher
-    # ----------------------------------------------------------------
-    # `-evp` гарантирует использование EVP path → подхватит ARM Crypto Ext.
-    # `-elapsed` — реальная стенка, не CPU time.
-    # Размеры буферов: 64, 256, 1024, 8192, 16384 байт.
-    step("openssl speed aes-128-gcm",
-         "openssl speed -elapsed -evp aes-128-gcm",
-         timeout=120, echo_lines=15)
-    step("openssl speed aes-256-gcm",
-         "openssl speed -elapsed -evp aes-256-gcm",
-         timeout=120, echo_lines=15)
-    step("openssl speed aes-256-ctr",
-         "openssl speed -elapsed -evp aes-256-ctr",
-         timeout=120, echo_lines=15)
-    step("openssl speed chacha20-poly1305",
-         "openssl speed -elapsed -evp chacha20-poly1305",
-         timeout=120, echo_lines=15)
-    step("openssl speed sha256",
-         "openssl speed -elapsed -evp sha256",
-         timeout=120, echo_lines=15)
+    step_user("openssl version -a", "openssl version -a")
 
     # ----------------------------------------------------------------
-    # 3. musdk_sam_kat — нужен root и тестовый файл с векторами
+    # 2. openssl speed — снимаем CPU-потолок с ARM Crypto Extensions
     # ----------------------------------------------------------------
-    # Сначала найдём, какие тестовые файлы есть.
-    step("find musdk test files",
-         "find / -xdev -name '*.txt' -path '*musdk*' 2>/dev/null; "
-         "find / -xdev -name '*.txt' -path '*sam*' 2>/dev/null; "
-         "find /usr/share -xdev -type d -name '*musdk*' 2>/dev/null; "
-         "ls -la /usr/share/musdk 2>/dev/null; "
-         "dpkg -L musdk 2>/dev/null | head -30")
+    step_user("openssl speed aes-128-gcm",
+              "openssl speed -elapsed -evp aes-128-gcm 2>&1",
+              timeout=180, echo=20)
+    step_user("openssl speed aes-256-gcm",
+              "openssl speed -elapsed -evp aes-256-gcm 2>&1",
+              timeout=180, echo=20)
+    step_user("openssl speed aes-256-ctr",
+              "openssl speed -elapsed -evp aes-256-ctr 2>&1",
+              timeout=180, echo=20)
+    step_user("openssl speed chacha20-poly1305",
+              "openssl speed -elapsed -evp chacha20-poly1305 2>&1",
+              timeout=180, echo=20)
+    step_user("openssl speed sha256",
+              "openssl speed -elapsed -evp sha256 2>&1",
+              timeout=180, echo=20)
 
-    # KAT обычно поставляется в виде <name>.txt — пробуем стандартное имя.
-    # Если найдём через find выше — выберем оттуда вручную.
-    step("musdk_sam_kat run (default test)",
-         "musdk_sam_kat cio-0:0 /usr/share/musdk/aes_128_cbc.txt -c 1000 2>&1 || "
-         "musdk_sam_kat cio-0:0 aes_128_cbc.txt -c 1000 2>&1 || true",
-         sudo=True, timeout=60, echo_lines=20)
+    # ----------------------------------------------------------------
+    # 3. musdk_sam_kat — нужен root + CMA + тестовый файл
+    # ----------------------------------------------------------------
+    # Сначала найдём, где живут тестовые файлы.
+    step_root("locate musdk test files",
+              "find / -xdev -name '*.txt' -path '*musdk*' 2>/dev/null; "
+              "find / -xdev -name '*sam*test*' 2>/dev/null; "
+              "find /usr/share -xdev -type d 2>/dev/null | grep -iE 'musdk|sam' | head -5; "
+              "ls /usr/share/musdk 2>/dev/null; "
+              "dpkg -L musdk 2>/dev/null | head -40; "
+              "dpkg -L musdk-dev 2>/dev/null | head -10; "
+              "dpkg -l | grep -i musdk")
+
+    # Базовый kat-запуск с дефолтным CIO.
+    step_root("musdk_sam_kat --help",
+              "musdk_sam_kat --help 2>&1 || musdk_sam_kat -h 2>&1",
+              echo=30)
+
+    # Попробуем запустить — без тест-файла он подскажет, какие принимает.
+    step_root("musdk_sam_kat probe",
+              "musdk_sam_kat cio-0:0 2>&1 | head -30 || true")
 
     log.close()
-    tc.close(); jc.close()
-    print(f"\n[+] full log saved to: {log_path}")
+    tc.close()
+    jc.close()
+    print(f"\n[+] full log: {LOG_PATH}")
 
 
 if __name__ == "__main__":
