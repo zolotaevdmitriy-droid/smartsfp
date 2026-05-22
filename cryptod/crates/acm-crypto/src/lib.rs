@@ -4,28 +4,35 @@
 //! implementation **swappable** without touching the transport / pipeline
 //! code. We will go through several implementations:
 //!
-//! * Phase 1: software AES-GCM (for unit tests + bringup).
+//! * Phase 1: software AES-GCM (this file, [`aes_gcm_sw`]) — uses the
+//!   RustCrypto `aes-gcm` crate which on aarch64 auto-detects ARMv8
+//!   Crypto Extensions at runtime (AESE/AESD/PMULL).
 //! * Phase 1: hardware AES-GCM via Marvell SAM (EIP-97) through MUSDK /
-//!   DPDK `rte_crypto_mvsam`. Line-rate 1 Gbps on ISM4120I.
-//! * Phase 2: software O'z DSt 1105:2009 with NEON SIMD on ARMv8.
+//!   DPDK `rte_crypto_mvsam`. Line-rate 1 Gbps on ISM4120I. TBD.
+//! * Phase 2: software O'z DSt 1105:2009 with NEON SIMD on ARMv8. TBD.
 //! * Phase 3: certified Uzbek O'z DSt 1105 library (vendor SDK), loaded
-//!   through the same trait.
+//!   through the same trait. TBD.
 //!
-//! Frame wire format carries the [`AlgoId`] in plaintext so multiple
-//! algorithms can coexist during migration.
+//! The wire format ([`acm-wire`]) carries the [`AlgoId`] in plaintext so
+//! multiple algorithms can coexist during the migration period.
 
 use thiserror::Error;
+use zeroize::{Zeroize, ZeroizeOnDrop};
+
+pub mod aes_gcm_sw;
 
 #[derive(Debug, Error)]
 pub enum CryptoError {
-    #[error("invalid key length")]
-    InvalidKey,
-    #[error("invalid nonce length")]
-    InvalidNonce,
-    #[error("output buffer too small")]
-    BufferTooSmall,
+    #[error("invalid key length (expected {expected}, got {got})")]
+    InvalidKey { expected: usize, got: usize },
+    #[error("invalid nonce length (expected {expected}, got {got})")]
+    InvalidNonce { expected: usize, got: usize },
+    #[error("output buffer too small (need at least {need} bytes, have {have})")]
+    BufferTooSmall { need: usize, have: usize },
     #[error("authentication failed")]
     AuthFailed,
+    #[error("algorithm mismatch (provider is {provider:?}, key is {key:?})")]
+    AlgorithmMismatch { provider: AlgoId, key: AlgoId },
     #[error("provider unavailable: {0}")]
     ProviderUnavailable(String),
     #[error("io: {0}")]
@@ -78,25 +85,52 @@ impl AlgoId {
     }
 }
 
-/// Opaque key handle. Concrete providers decide what's behind it: raw bytes
-/// in memory, a slot inside MUSDK SAM, a PKCS#11 object handle, a TPM
-/// sealed blob, etc. Pipeline code never deals with raw key material.
-#[derive(Debug, Clone)]
+/// Opaque key handle.
+///
+/// Holds raw key material plus the algorithm it was bound to. `Drop`
+/// zeroizes the buffer so master keys / session keys don't leak through
+/// freed memory. Pipeline code never deals with bare `Vec<u8>` keys.
+///
+/// **Phase 2+:** replace `material` with a backend-specific opaque ref
+/// (MUSDK SAM session slot, PKCS#11 object handle, TPM sealed blob, …)
+/// without touching the trait or downstream code.
+#[derive(Debug, Clone, ZeroizeOnDrop)]
 pub struct KeyHandle {
     pub id: u32,
+    #[zeroize(skip)]
     pub algo: AlgoId,
-    // For Phase 1 — keep material inline. Phase 2+ — replace with opaque
-    // backend-specific reference and a `Drop` impl that zeroizes.
     pub material: Vec<u8>,
 }
 
+impl KeyHandle {
+    pub fn new(id: u32, algo: AlgoId, material: Vec<u8>) -> Result<Self, CryptoError> {
+        if material.len() != algo.key_len() {
+            return Err(CryptoError::InvalidKey {
+                expected: algo.key_len(),
+                got: material.len(),
+            });
+        }
+        Ok(Self { id, algo, material })
+    }
+
+    /// Erase key material immediately, before drop.
+    pub fn wipe(&mut self) {
+        self.material.zeroize();
+    }
+}
+
 /// AEAD provider. All ACM-UZ transport encryption goes through this trait.
+///
+/// Implementations are expected to be **thread-safe** (the datapath holds
+/// a single `Arc<dyn CryptoProvider>` shared across worker threads).
 pub trait CryptoProvider: Send + Sync {
     /// The algorithm this provider implements.
     fn algorithm(&self) -> AlgoId;
 
-    /// Encrypt `plaintext` with `aad`, writing ciphertext-then-tag into `out`.
-    /// Returns total bytes written (`plaintext.len() + algo.tag_len()`).
+    /// Encrypt `plaintext` with `aad`, writing ciphertext-then-tag into
+    /// `out`. Returns total bytes written (`plaintext.len() + tag_len()`).
+    ///
+    /// Caller must pass `out` of at least `plaintext.len() + tag_len()`.
     fn seal(
         &self,
         key: &KeyHandle,
@@ -108,6 +142,8 @@ pub trait CryptoProvider: Send + Sync {
 
     /// Decrypt `ciphertext` (which has the tag appended) with `aad`,
     /// writing plaintext into `out`. Returns plaintext length.
+    ///
+    /// Returns [`CryptoError::AuthFailed`] on tag mismatch.
     fn open(
         &self,
         key: &KeyHandle,
@@ -117,11 +153,6 @@ pub trait CryptoProvider: Send + Sync {
         out: &mut [u8],
     ) -> Result<usize, CryptoError>;
 }
-
-// TODO Phase 1: pub mod aes_gcm_sw;     // pure-Rust AES-GCM for tests
-// TODO Phase 1: pub mod aes_gcm_sam;    // hardware AES-GCM via MUSDK SAM
-// TODO Phase 2: pub mod ozdst1105_sw;   // own Rust impl, NEON-optimized
-// TODO Phase 3: pub mod ozdst1105_certified;  // FFI to certified library
 
 #[cfg(test)]
 mod tests {
@@ -136,8 +167,35 @@ mod tests {
     }
 
     #[test]
-    fn algo_id_key_lengths() {
+    fn algo_id_lengths() {
         assert_eq!(AlgoId::Aes128Gcm.key_len(), 16);
         assert_eq!(AlgoId::Aes256Gcm.key_len(), 32);
+        assert_eq!(AlgoId::Aes128Gcm.nonce_len(), 12);
+        assert_eq!(AlgoId::Aes128Gcm.tag_len(), 16);
+    }
+
+    #[test]
+    fn keyhandle_rejects_wrong_length() {
+        let bad = KeyHandle::new(1, AlgoId::Aes256Gcm, vec![0u8; 16]);
+        assert!(matches!(
+            bad,
+            Err(CryptoError::InvalidKey {
+                expected: 32,
+                got: 16
+            })
+        ));
+    }
+
+    #[test]
+    fn keyhandle_accepts_correct_length() {
+        let ok = KeyHandle::new(1, AlgoId::Aes128Gcm, vec![0u8; 16]);
+        assert!(ok.is_ok());
+    }
+
+    #[test]
+    fn keyhandle_wipe_zeroes_material() {
+        let mut k = KeyHandle::new(1, AlgoId::Aes128Gcm, vec![0xABu8; 16]).unwrap();
+        k.wipe();
+        assert!(k.material.iter().all(|b| *b == 0));
     }
 }

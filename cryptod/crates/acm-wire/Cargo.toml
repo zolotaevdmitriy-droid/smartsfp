@@ -11,3 +11,6 @@ acm-crypto = { path = "../acm-crypto" }
 anyhow.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
+
+[dev-dependencies]
+hex = "0.4"

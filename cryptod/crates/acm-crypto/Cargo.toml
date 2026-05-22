@@ -9,3 +9,17 @@ description = "Crypto provider abstraction for ACM-UZ datapath. Pluggable AES / 
 [dependencies]
 anyhow.workspace = true
 thiserror.workspace = true
+
+# Software AES-GCM. On aarch64 with ARMv8 Crypto Extensions the `aes` crate
+# auto-detects AES instructions at runtime and uses them. No extra config
+# needed beyond enabling the `aes` feature flag and depending on aarch64-
+# capable RustCrypto crates.
+aes-gcm = { version = "0.10", features = ["aes"] }
+# Zeroize on drop for any in-memory secret material (KeyHandle, etc.).
+zeroize = { version = "1", features = ["zeroize_derive"] }
+# Constant-time comparisons (where we need them outside AEAD itself).
+subtle = "2"
+
+[dev-dependencies]
+# Hex helpers for KAT vectors in tests.
+hex = "0.4"
