@@ -19,6 +19,7 @@
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+pub mod aes_gcm_ring;
 pub mod aes_gcm_sw;
 
 #[derive(Debug, Error)]

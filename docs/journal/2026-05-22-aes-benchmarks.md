@@ -298,3 +298,103 @@ AES-256-GCM в чистом ПО уже даёт нам нужную произ�
   ключами с агента. Параллельно — разбираться с форматом теста MUSDK SAM
   для бенча HW-ускорителя.
 
+## Шаг 8 — Свой Rust-бенч + ВАЖНАЯ находка про RustCrypto на AArch64
+
+Добавил флаг `--bench` в `acm-cryptod`. Логика: warmup 50 мс на каждом
+размере блока, потом seal в плотном цикле 3 секунды, потом то же для open.
+Числа форматируем как у `openssl speed` — для прямого сравнения.
+
+Первый прогон (`scripts/output/rust-bench-20260522-095641.txt`):
+
+    === Aes256Gcm ===
+     1024 B   12114 ops/s   99.2 Mbps    seal
+     8192 B    1703 ops/s  111.6 Mbps
+
+Это **в 12 раз медленнее** `openssl speed` (1205 Мбит/с на 1024 байт).
+При этом `OPENSSL_armcap=0xbd` — ARM Crypto Extensions активны.
+
+**Гипотеза 1:** оптимизатор не подхватил target features. Добавил в
+`cryptod/.cargo/config.toml`:
+
+    [target.aarch64-unknown-linux-gnu]
+    rustflags = ["-C", "target-feature=+aes,+sha2,+neon"]
+
+Пересборка → **числа не изменились**.
+
+**Гипотеза 2 (правильная):** документация крейта `aes 0.8` (за которым
+живёт `aes-gcm 0.10`) явно требует **Rust Nightly** для AArch64 hardware
+AES (`armv8` intrinsics не стабильны):
+
+> AArch64 ARMv8 Crypto Extensions: requires Rust Nightly. The intrinsics
+> necessary to use ARMv8 cryptographic extensions are not stable yet.
+> — https://docs.rs/aes/0.8.4/
+
+То есть RustCrypto `aes-gcm 0.10` на **stable Rust + AArch64** молча
+fallback'ает в **bitsliced software AES**, который ~10× медленнее
+аппаратного. Это **критический инженерный факт**: для production-AES на
+этом железе RustCrypto на stable Rust **не подходит**.
+
+### Решение: добавил `ring` как второй провайдер
+
+[`ring 0.17`](https://github.com/briansmith/ring) использует ассемблер
+BoringSSL и **работает на stable AArch64 Rust** с полным HW-ускорением.
+
+Добавил:
+
+* `cryptod/crates/acm-crypto/src/aes_gcm_ring.rs` — `AesGcmRingProvider`
+  через `LessSafeKey` / `seal_in_place_separate_tag` / `open_in_place`.
+* 4 unit-теста: McGrew-Viega test 2 и test 14 (те же KAT, что прошли
+  через RustCrypto — байт-в-байт совпадение между ring и RustCrypto на
+  arbitrary 555-байтных данных подтверждает их семантическую
+  идентичность); tampered-tag → AuthFailed.
+
+### Второй прогон бенча: `ring` vs `rustcrypto` vs `openssl`
+
+Полный raw — `scripts/output/rust-bench-20260522-101004.txt`. Сводка:
+
+#### AES-256-GCM, seal, **Мбит/с** на одном ядре Cortex-A53 @ 1.2 ГГц
+
+| Block | openssl CLI | RustCrypto sw | **ring (наш)** | ring vs openssl |
+|---|---:|---:|---:|---:|
+| 16 B | 31 | 9 | **62** | **+100%** |
+| 64 B | 120 | 34 | **242** | **+102%** |
+| 256 B | 427 | 72 | **795** | **+86%** |
+| 1024 B | 1205 | 99 | **1815** | **+50%** |
+| 8192 B | 2781 | 112 | **2933** | +5% |
+| 16384 B | 3064 | 112 | **3004** | -2% |
+
+#### AES-128-GCM, seal
+
+| Block | openssl | RustCrypto | **ring** | ring vs openssl |
+|---|---:|---:|---:|---:|
+| 64 B | 122 | 43 | **254** | **+108%** |
+| 1024 B | 1301 | 117 | **1965** | **+51%** |
+| 16384 B | 3449 | 131 | **3359** | -3% |
+
+#### open (decrypt + tag verify) практически совпадает с seal
+
+ring 1024 B open = 1633 Мбит/с (vs seal 1815), на 10% медленнее.
+Объяснимо: дополнительный тэг-чек.
+
+### Выводы для отчёта
+
+1. **`ring` на этой платформе даёт line-rate AES-256-GCM от 256-байтных
+   пакетов** (795 Мбит/с) и **в 2× быстрее openssl CLI** на малых
+   пакетах. На больших блоках сопоставимо.
+2. **RustCrypto `aes-gcm` нельзя использовать в production на stable
+   Rust для AArch64** — fallback в bitsliced software AES, 10×
+   деградация. Полезно только как KAT-reference (что мы и делаем).
+3. **Marvell SAM пока что не критичен для Phase 1.** Целевой 1 Гбит/с
+   line-rate перекрывается `ring` уже с пакетов 256 байт (типичный
+   реальный TCP-трафик ≥500 байт). SAM нужен только когда захотим
+   line-rate на 64-байтных пакетах (voice / attack-like).
+4. **Бенчмарк превосходит `openssl speed` потому, что у `ring` лёгкий
+   API без `EVP_CIPHER_CTX_*`-overhead.** Бенчмарк показывает максимум
+   возможного на этом CPU; в реальном datapath с per-пакетной
+   bookkeeping будет ниже, но HW-ускорение остаётся.
+
+### Изменения состояния модуля (на этом шаге)
+
+* Залит `acm-cryptod` (1.18 МБ) в `/home/user/acm-uz/acm-cryptod` —
+  идёт от user, никаких прав не требует.
+

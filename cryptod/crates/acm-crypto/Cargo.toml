@@ -10,11 +10,16 @@ description = "Crypto provider abstraction for ACM-UZ datapath. Pluggable AES / 
 anyhow.workspace = true
 thiserror.workspace = true
 
-# Software AES-GCM. On aarch64 with ARMv8 Crypto Extensions the `aes` crate
-# auto-detects AES instructions at runtime and uses them. No extra config
-# needed beyond enabling the `aes` feature flag and depending on aarch64-
-# capable RustCrypto crates.
+# Reference PoC AES-GCM (RustCrypto). NOTE: on AArch64 stable Rust this
+# falls back to bitsliced software AES (~120 Мбит/с on Cortex-A53), the
+# `aes 0.8` crate underneath requires nightly for ARMv8 Crypto Extensions.
+# We keep this as KAT-reference / unit-test provider.
 aes-gcm = { version = "0.10", features = ["aes"] }
+
+# Production-grade PoC AES-GCM via `ring` (BoringSSL assembly, includes
+# AArch64 ARMv8 Crypto Extensions support on stable Rust). Used for the
+# actual benchmark and as the default Phase-1 provider until SAM is wired.
+ring = "0.17"
 # Zeroize on drop for any in-memory secret material (KeyHandle, etc.).
 zeroize = { version = "1", features = ["zeroize_derive"] }
 # Constant-time comparisons (where we need them outside AEAD itself).
