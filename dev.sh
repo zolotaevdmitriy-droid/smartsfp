@@ -19,6 +19,7 @@ IMAGE_TAG="acm-uz/builder:latest"
 # re-download every time. Survive image rebuilds.
 CARGO_VOL="acm-uz-cargo-registry"
 GO_VOL="acm-uz-go-modcache"
+NPM_VOL="acm-uz-npm-cache"
 
 # On Windows / Git Bash MSYS auto-converts /work to C:\work which we DON'T
 # want — keep paths literal. MSYS_NO_PATHCONV=1 disables that conversion.
@@ -29,6 +30,7 @@ run_in_container() {
     -v "${REPO_ROOT}":/work \
     -v "${CARGO_VOL}":/usr/local/cargo/registry \
     -v "${GO_VOL}":/go/pkg/mod \
+    -v "${NPM_VOL}":/root/.npm \
     -w /work \
     "${IMAGE_TAG}" \
     bash -c "$1"
@@ -39,6 +41,7 @@ run_in_container_tty() {
     -v "${REPO_ROOT}":/work \
     -v "${CARGO_VOL}":/usr/local/cargo/registry \
     -v "${GO_VOL}":/go/pkg/mod \
+    -v "${NPM_VOL}":/root/.npm \
     -w /work \
     "${IMAGE_TAG}" \
     "$@"
@@ -61,6 +64,18 @@ case "$cmd" in
     mkdir -p dist
     run_in_container '
       set -e
+
+      echo "=== Build web-ui (Svelte 5 + Vite) ==="
+      cd web-ui
+      # Reuse node_modules cache between runs if present.
+      [ -d node_modules ] || npm install --silent
+      npm run build
+      cd ..
+
+      echo "=== Copy SPA bundle into agent embed dir ==="
+      rm -rf agent/internal/web/dist
+      cp -r web-ui/dist agent/internal/web/dist
+
       echo "=== Build cryptod (aarch64) ==="
       cd cryptod
       cargo build --release --target aarch64-unknown-linux-gnu

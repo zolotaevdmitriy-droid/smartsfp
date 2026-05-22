@@ -22,22 +22,38 @@ import (
 	"time"
 
 	"github.com/zolotaevdmitriy-droid/smartsfp/agent/internal/ipc"
+	"github.com/zolotaevdmitriy-droid/smartsfp/agent/internal/sysmon"
 )
 
 type API struct {
 	cli *ipc.Client
+	sys *sysmon.Reader
 }
 
-func New(cli *ipc.Client) *API {
-	return &API{cli: cli}
+func New(cli *ipc.Client, sys *sysmon.Reader) *API {
+	return &API{cli: cli, sys: sys}
 }
 
 // Routes attaches all endpoints to the given mux.
 func (a *API) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/status", a.handleStatus)
 	mux.HandleFunc("/api/v1/keys/rotate", a.handleRotateKey)
+	mux.HandleFunc("/api/v1/system", a.handleSystem)
 	mux.HandleFunc("/healthz", a.handleHealthz)
 	mux.HandleFunc("/readyz", a.handleReadyz)
+}
+
+func (a *API) handleSystem(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	snap, err := a.sys.Snapshot()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, snap)
 }
 
 func (a *API) handleStatus(w http.ResponseWriter, r *http.Request) {

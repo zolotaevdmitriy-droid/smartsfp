@@ -33,6 +33,7 @@ import (
 	"github.com/zolotaevdmitriy-droid/smartsfp/agent/internal/httpapi"
 	"github.com/zolotaevdmitriy-droid/smartsfp/agent/internal/ipc"
 	"github.com/zolotaevdmitriy-droid/smartsfp/agent/internal/metrics"
+	"github.com/zolotaevdmitriy-droid/smartsfp/agent/internal/sysmon"
 	"github.com/zolotaevdmitriy-droid/smartsfp/agent/internal/web"
 )
 
@@ -55,10 +56,14 @@ func main() {
 	cli := ipc.New(*cryptodSock)
 	defer func() { _ = cli.Close() }()
 
-	// Prometheus registry: only the cryptod collector + standard process/Go
-	// metrics so /metrics is useful for both fleet ops and Go runtime debug.
+	// System monitor: reads /proc, /sys/class/hwmon, /proc/net/dev with
+	// internal state for CPU% and network rate deltas.
+	sys := sysmon.NewReader()
+
+	// Prometheus registry: cryptod (UDS) + module sysmon + go runtime.
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(metrics.New(cli))
+	reg.MustRegister(metrics.NewSystem(sys))
 	reg.MustRegister(collectors.NewGoCollector())
 	reg.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{
 		Namespace: "acm_agent",
@@ -68,7 +73,7 @@ func main() {
 	// endpoints are on the management plane.
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
-	httpapi.New(cli).Routes(mux)
+	httpapi.New(cli, sys).Routes(mux)
 
 	// Static UI under /. The embed package lives next to the HTML so
 	// `//go:embed` works without ../ paths.
